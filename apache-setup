@@ -1,0 +1,42 @@
+yum install httpd
+iptables -I INPUT -p tcp -m state --state NEW -m tcp --dport 80 -j ACCEPT
+cat /etc/httpd/conf.d/serverstatus.conf << EOF
+
+EOF
+sten 127.0.0.1:80
+<Location /server-status>
+SetHandler server-status
+Order deny,allow
+Deny from all
+Allow from 127.0.0.1
+</Location>
+
+sed -i 's/Listen/#Listen/' /etc/httpd/conf/httpd.conf
+
+systemctl restart httpd
+
+weget http://127.0.0.1/server-status
+
+cat /var/www/html/index.html <<EOF
+<html>
+<h1>node1</h1>
+</html>
+EOF
+
+systemctl stop httpd
+echo "Listen 192.168.202.100:80"|sudo tee --append /etc/httpd/conf/httpd.conf
+pcs resource create webserver ocf:heartbeat:apache configfile=/etc/httpd/conf/httpd.conf statusurl="http://localhost/server-status" op monitor interval=1min
+
+pcs constraint colocation add webserver virtual_ip INFINITY
+pcs constraint colocation add webserver virtual_ip INFINITY
+pcs constraint order virtual_ip then webserver
+pcs constraint location webserver prefers node01=50
+pcs constraint
+pcs cluster stop --all && sudo pcs cluster start --all
+
+
+pcs cluster stop node01
+pcs status
+
+systemctl enable pcsd
+

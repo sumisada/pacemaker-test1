@@ -1,0 +1,148 @@
+# Package
+yum -y install wget
+rpm -Uvh http://elrepo.org/elrepo-release-6-5.el6.elrepo.noarch.rpm
+yum -y install drbd84-utils kmod-drbd84 --enablerepo=elrepo
+yum -y install pacemaker corosync cluster-glue
+
+# Cluster 
+yum -y install wget
+rpm -Uvh http://elrepo.org/elrepo-release-6-5.el6.elrepo.noarch.rpm
+yum -y install drbd84-utils kmod-drbd84 --enablerepo=elrepo
+yum -y install pacemaker corosync cluster-glue
+
+# iptables
+-A INPUT -p udp -m state --state NEW -m multiport --dports 5404,5405 -j ACCEPT
+-A INPUT -m tcp -p tcp --dport 7788 -j ACCEPT
+-A INPUT -m tcp -p tcp --dport 3306 -j ACCEPT
+
+service iptables restart
+
+# corosync.config
+
+corosync.conf <<EOF
+totem {
+	version: 2
+	secauth: off
+	threads: 0
+	interface {
+		ringnumber: 0
+		bindnetaddr: 192.168.1.0
+		mcastaddr: 226.94.1.1
+		mcastport: 5405
+		ttl: 1
+	}
+}
+
+logging {
+	fileline: off
+	to_stderr: no
+	to_logfile: yes
+	to_syslog: yes
+	logfile: /var/log/cluster/corosync.log
+	debug: off
+	timestamp: on
+	logger_subsys {
+		subsys: AMF
+		debug: off
+	}
+}
+
+amf {
+	mode: disabled
+}
+
+service {
+        # Load the Pacemaker Cluster Resource Manager  
+        ver:       1
+        name:      pacemaker
+}
+
+aisexec {
+        user:   root
+        group:  root
+}
+
+EOF
+
+chkconfig --level 3 corosync on
+service corosync start
+chkconfig --level 3 pacemaker on
+service pacemaker start
+
+corosync-objctl runtime.totem.pg.mrp.srp.members
+
+yum install mysql-server
+wget -P /etc/yum.repos.d/ http://download.opensuse.org/repositories/network:/ha-clustering/CentOS_CentOS-6/network:ha-clustering.repo
+yum install crmsh
+
+crm configure
+property no-quorum-policy="ignore" pe-warn-series-max="1000" pe-input-series-max="1000" pe-error-series-max="1000" cluster-recheck-interval="5min"
+property stonith-enabled=false
+commit
+exit
+
+#DRBD
+
+global { usage-count no; }
+resource mysql {
+  protocol C;
+  startup { wfc-timeout 0; degr-wfc-timeout     120; }
+  disk { on-io-error detach; } # or panic, ...
+  net {  cram-hmac-alg "sha1"; shared-secret "mySecret"; }
+  syncer { rate 10M; }
+  on node1.behindtheracks.com {
+    device /dev/drbd0;
+    disk /dev/sdb;
+    address 192.168.1.10:7788;
+    meta-disk internal;
+  }
+  on node2.behindtheracks.com {
+    device /dev/drbd0;
+    disk /dev/sdb;
+    address 192.168.1.11:7788;
+    meta-disk internal;
+  }
+}
+
+drbdadm create-md mysql
+modprobe drbd
+drbdadm up mysql
+
+drbdadm -- --force primary mysql
+mkfs.xfs /dev/drbd0
+drbdadm secondary mysql
+
+cat /proc/drbd
+
+yum install mysql-server
+
+bind-address = 192.168.1.12
+
+crm configure
+primitive p_ip_mysql ocf:heartbeat:IPaddr2 params ip="192.168.1.12" cidr_netmask="24" op monitor interval="30s"
+primitive p_drbd_mysql ocf:linbit:drbd params drbd_resource="mysql" op start timeout="90s" op stop timeout="180s" op promote timeout="180s" op demote timeout="180s" op monitor interval="30s" role="Slave" op monitor interval="29s" role="Master"
+primitive p_mysql lsb:mysqld op monitor interval="20s" timeout="10s" op start timeout="120s" op stop timeout="120s"
+primitive p_fs_mysql ocf:heartbeat:Filesystem params device="/dev/drbd0" directory="/var/lib/mysql" fstype="xfs" options="noatime" op start timeout="60s" op stop timeout="180s" op monitor interval="60s" timeout="60s"
+group g_mysql p_ip_mysql p_fs_mysql p_mysql 
+ms ms_drbd_mysql p_drbd_mysql meta notify="true" clone-max="2"
+colocation c_mysql_on_drbd inf: g_mysql ms_drbd_mysql:Master
+order o_drbd_before_mysql inf: ms_drbd_mysql:promote g_mysql:start
+commit
+exit
+
+crm configure
+primitive p_ip_mysql ocf:heartbeat:IPaddr2 params ip="192.168.1.12" cidr_netmask="24" op monitor interval="30s"
+primitive p_mysql lsb:mysqld op monitor interval="20s" timeout="10s" op start timeout="120s" op stop timeout="120s"
+primitive p_fs_mysql ocf:heartbeat:Filesystem params device="/dev/sdb1" directory="/var/lib/mysql" fstype="ext4" options="noatime" op start timeout="60s" op stop timeout="180s" op monitor interval="60s" timeout="60s"
+group g_mysql p_ip_mysql p_fs_mysql p_mysql 
+commit
+exit
+
+crm_mon -1
+
+mysql_secure_installation
+mysql -u root -p
+grant all on *.* to 'root'@'%' identified by 'yourpassword';
+quit;
+
+
